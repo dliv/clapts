@@ -1,201 +1,126 @@
-type SignalAccumulator<T> = {
-    _meta: Meta<T>;
-    byId: IdMap<T>;
-    bySignal: SignalMap;
-    size: number;
-    minTs: number | null;
-    maxTs: number | null;
-};
+import assert from 'assert'; // TODO: not browser safe
 
-type Meta<T> = {
-    idKey: string & keyof T;
-    signalKey: string & keyof T;
-    timeKey: string & keyof T;
-    maxSize: number;
-};
+import { Limiter } from './limiter';
 
-/**
- * Maps the signal / entity-type id to the matching subset (array) of items.
- *
- * Avoid a real `Map` because we nedd:
- * - to maybe use this with Redux
- * - JSON serializability
- * - immutable updates with structural sharing
- */
-type SignalMap = { [k: string]: string[] };
-type IdMap<T> = { [k: string]: T };
-
-/**
- * Initial method for creating a time series accumulator.
- * @param items
- * @param _meta
- * @returns A structure that can be converted to renderable items with `toArray()` or extended
- *  with new data points via `add()`.
- */
-export function toSignals<T>(
-    items: readonly T[],
-    _meta: Meta<T>,
-): SignalAccumulator<T> {
-    const init: SignalAccumulator<T> = {
+function newSignalAccum<T>(_meta: Meta<T>): SignalAccumulator<T> {
+    return {
         _meta,
         byId: {},
         bySignal: {},
-        size: 0,
-        minTs: null,
-        maxTs: null,
     };
-    return add(init, items);
+}
+
+export function toSignals<T>(
+    meta: Meta<T>,
+    items: readonly T[],
+): SignalAccumulator<T> {
+    return add(newSignalAccum(meta), items);
 }
 
 export function add<T>(
     signals: SignalAccumulator<T>,
-    items: readonly T[],
+    rawItems: readonly T[],
 ): SignalAccumulator<T> {
-    const { idKey, signalKey, timeKey, maxSize } = signals._meta;
+    const items = mapFilterItems(signals._meta, rawItems);
+    if (items.length < 1) {
+        return newSignalAccum(signals._meta);
+    }
+
     let byId = { ...signals.byId };
     const bySignal = { ...signals.bySignal };
-    let size = signals.size;
-    const selectiveAdd = signals.size + items.length > maxSize;
-    const signalCount = countSignals(signals, items);
-    const intervalsPerSignal =
-        selectiveAdd && signalCount > 0
-            ? Math.floor(maxSize / signalCount)
-            : null;
-    const signalIntervalTracker: Map<string, Set<number>> = new Map();
-    const [minTs, maxTs] = getMinMaxTs(signals, items);
-    const delta =
-        // TODO: excessive runtime checks all over the place
-        // maybe we need to filter and map `items` to something static and safer
-        typeof maxTs === 'number' &&
-        typeof minTs === 'number' &&
-        typeof intervalsPerSignal === 'number'
-            ? (maxTs - minTs) / intervalsPerSignal
+
+    const limiter =
+        getSize(signals, items) > signals._meta.maxSize
+            ? Limiter.make(signals, items)
             : null;
 
-    // TODO: DRY with main loop below
-    // when we would exceed the max size
-    // reduce the initial state to one item per signal per time chunk
-    if (
-        selectiveAdd &&
-        typeof delta === 'number' &&
-        typeof minTs === 'number'
-    ) {
-        size = 0;
+    // thin the previous data when we have too many items
+    if (limiter) {
         const newById: typeof byId = {};
         for (const [signal, itemIds] of Object.entries(bySignal)) {
             bySignal[signal] = [];
             for (const id of itemIds) {
                 const item = byId[id];
-                const ts = item?.[timeKey];
-                if (!(item && typeof ts === 'number')) {
-                    continue;
-                }
-                const relativeTime = ts - minTs;
-                const interval = Math.floor(relativeTime / delta);
-                let intervalTracker = signalIntervalTracker.get(signal);
-                if (!intervalTracker) {
-                    intervalTracker = new Set<number>();
-                    signalIntervalTracker.set(signal, intervalTracker);
-                }
-                if (!intervalTracker.has(interval)) {
-                    intervalTracker.add(interval);
+                if (item && !limiter.isUsedTime(signal, item.t)) {
+                    limiter.markUsedTime(signal, item.t);
                     bySignal[signal].push(id);
                     newById[id] = item;
-                    ++size;
                 }
             }
         }
         byId = newById;
     }
 
-    for (const i of items) {
-        const signal = i[signalKey];
-        const id = i[idKey];
-        const ts = i[timeKey];
-        if (
-            !(
-                typeof signal === 'string' &&
-                typeof id === 'string' &&
-                typeof ts === 'number'
-            ) ||
-            byId[id]
-        ) {
+    // add new items, TODO: rewrite to be less cyclomatic-goto-shitty
+    for (const it of items) {
+        // the "new" items may intersect with the existing items
+        if (byId[it.i]) {
             continue;
         }
 
-        // if these items would make the new collection exceed max size
-        // limit (by `continue`) to one add per signal per time chunk
+        // thin (via `continue`) the new data when we have too many items
         // TODO: keep last point instead of first in each chunk
-        if (selectiveAdd) {
-            if (typeof delta !== 'number' || typeof minTs !== 'number') {
-                continue;
-            }
-            const relativeTime = ts - minTs;
-            const interval = Math.floor(relativeTime / delta);
-            let intervalTracker = signalIntervalTracker.get(signal);
-            if (!intervalTracker) {
-                intervalTracker = new Set<number>();
-                signalIntervalTracker.set(signal, intervalTracker);
-            }
-            if (intervalTracker.has(interval)) {
-                continue;
+        if (limiter) {
+            if (!limiter.isUsedTime(it.s, it.t)) {
+                limiter.markUsedTime(it.s, it.t);
             } else {
-                intervalTracker.add(interval);
+                continue;
             }
         }
 
-        byId[id] = i;
-        const sig = (bySignal[signal] ??= []);
-        sig.push(id);
-        ++size;
+        byId[it.i] = it;
+        const sig = (bySignal[it.s] ??= []);
+        sig.push(it.i);
     }
+
     return {
         _meta: { ...signals._meta },
         byId,
         bySignal,
-        size,
-        minTs,
-        maxTs,
     };
 }
 
-function countSignals<T>(
-    signals: SignalAccumulator<T>,
+function mapFilterItems<T>(
+    { idKey, signalKey, timeKey }: Meta<T>,
     items: readonly T[],
+): InternalItem[] {
+    const cleanItems: InternalItem[] = [];
+    for (const it of items) {
+        const s = it[signalKey];
+        const i = it[idKey];
+        const t = it[timeKey];
+        if (
+            s &&
+            typeof s === 'string' &&
+            i &&
+            typeof i === 'string' &&
+            typeof t === 'number' && // redundant with `Number.isFinite` but appease TS
+            Number.isFinite(t)
+        ) {
+            cleanItems.push({ s, i, t });
+        }
+    }
+    return cleanItems;
+}
+
+function getSize<T>(
+    signals: SignalAccumulator<T>,
+    newItems: InternalItem[] = [],
 ): number {
-    const { signalKey } = signals._meta;
-    const seen = new Set(Object.keys(signals.bySignal));
-    for (const i of items) {
-        const sig = i[signalKey];
-        if (typeof sig === 'string') {
-            seen.add(sig);
-        }
-    }
-    return seen.size;
+    const prevSizeBySignal = Object.values(signals.bySignal).reduce(
+        (accum, ids) => accum + ids.length,
+        0,
+    );
+    const prevSizeById = Object.keys(signals.byId).length;
+    assert(
+        prevSizeBySignal === prevSizeById,
+        `unequal sizes bySignal ${prevSizeBySignal} and byId ${prevSizeById}`,
+    );
+    return prevSizeBySignal + newItems.length;
 }
 
-function getMinMaxTs<T>(
-    signals: SignalAccumulator<T>,
-    items: readonly T[],
-): [number | null, number | null] {
-    const { timeKey } = signals._meta;
-    let minTs = signals.minTs;
-    let maxTs = signals.maxTs;
-    for (const i of items) {
-        const ts = i[timeKey];
-        if (typeof ts !== 'number') {
-            continue;
-        }
-        if (maxTs === null || ts > maxTs) {
-            maxTs = ts;
-        }
-        if (minTs === null || ts < minTs) {
-            minTs = ts;
-        }
-    }
-    return [minTs, maxTs];
-}
-
-export function toArray<T>(accum: SignalAccumulator<T>): T[] {
+export function toInternalArray<T>(
+    accum: SignalAccumulator<T>,
+): InternalItem[] {
     return Object.values(accum.byId);
 }
